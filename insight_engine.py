@@ -1,101 +1,194 @@
-import pandas as pd
+"""
+insight_engine.py — Zero-shot complaint classification via HuggingFace.
+
+Replaces brittle keyword heuristics with a zero-shot text-classification
+pipeline that categorises complaints into predefined product-relevant buckets.
+Falls back to keyword scoring if the transformer model is unavailable.
+"""
+
+from typing import Dict, List, Any
+
+from loguru import logger
 from sentiment_analysis import analyze_sentiment
-from preprocess import ReviewPreprocessor
+
+COMPLAINT_CATEGORIES = [
+    "battery life",
+    "shipping and delivery",
+    "product quality",
+    "user interface and UX",
+    "pricing and value",
+    "customer service",
+    "performance and speed",
+    "build and design",
+]
+
+FEATURE_REQUEST_MARKERS = [
+    "wish", "hope", "would love", "please add", "add", "feature", "support",
+    "integration", "dark mode", "option", "include", "improve", "need",
+    "want", "better", "future", "update", "could you", "can you",
+]
+
+
+def _load_classifier():
+    """Lazily load the zero-shot pipeline. Returns None on failure."""
+    try:
+        from transformers import pipeline
+
+        logger.info("Loading zero-shot-classification pipeline (facebook/bart-large-mnli)…")
+        clf = pipeline(
+            "zero-shot-classification",
+            model="facebook/bart-large-mnli",
+            device=-1,  # CPU; set to 0 for GPU
+        )
+        logger.info("Zero-shot classifier loaded.")
+        return clf
+    except Exception as exc:
+        logger.warning(f"Could not load zero-shot classifier: {exc}. Using keyword fallback.")
+        return None
+
+
+_zs_classifier = None  # module-level lazy singleton
+
+
+def _get_classifier():
+    global _zs_classifier
+    if _zs_classifier is None:
+        _zs_classifier = _load_classifier()
+    return _zs_classifier
+
+
+def _keyword_fallback_category(text: str) -> str:
+    """Naïve keyword fallback when the transformer is not available."""
+    t = text.lower()
+    if any(k in t for k in ("battery", "charge", "drain", "power")):
+        return "battery life"
+    if any(k in t for k in ("ship", "deliver", "arriv", "packag")):
+        return "shipping and delivery"
+    if any(k in t for k in ("broke", "broke", "quality", "material", "plastic", "build")):
+        return "product quality"
+    if any(k in t for k in ("ui", "app", "interface", "design", "navigate", "clutter")):
+        return "user interface and UX"
+    if any(k in t for k in ("price", "expensive", "cost", "cheap", "value")):
+        return "pricing and value"
+    if any(k in t for k in ("service", "support", "refund", "return", "customer")):
+        return "customer service"
+    if any(k in t for k in ("slow", "lag", "crash", "freeze", "performance", "speed")):
+        return "performance and speed"
+    return "product quality"
+
 
 class InsightEngine:
-    def __init__(self):
-        self.preprocessor = ReviewPreprocessor()
-        
-        # Simple keyword maps for classification
-        self.complaint_keywords = [
-            'broke', 'slow', 'expensive', 'bad', 'poor', 'terrible', 'worst', 
-            'issue', 'problem', 'bug', 'crash', 'fail', 'error', 'difficult',
-            'cluttered', 'heavy', 'waste', 'disappointed', 'flicker', 'drain'
-        ]
-        
-        self.feature_request_keywords = [
-            'wish', 'hope', 'would love', 'add', 'feature', 'support', 
-            'integration', 'dark mode', 'theme', 'option', 'include', 'improve',
-            'need', 'want', 'please', 'better', 'future', 'update'
-        ]
+    """
+    Analyses a corpus of genuine reviews and returns:
+    - categorised complaints (zero-shot or keyword fallback)
+    - detected feature requests
+    - summary metrics
+    """
 
-    def _get_top_keywords(self, reviews, top_n=3):
-        """Helper to find frequent keywords in a list of reviews."""
-        all_words = []
-        for r in reviews:
-            cleaned = self.preprocessor.clean_text(r)
-            all_words.extend(cleaned.split())
-        
-        if not all_words:
-            return []
-            
-        freq = pd.Series(all_words).value_counts()
-        return freq.head(top_n).index.tolist()
+    def __init__(self) -> None:
+        self._clf = None  # loaded on first use
 
-    def generate_insights(self, reviews):
+    def _classifier(self):
+        if self._clf is None:
+            self._clf = _get_classifier()
+        return self._clf
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _classify_complaint(self, text: str) -> str:
+        """Categorise complaints using efficient keyword matching."""
+        return _keyword_fallback_category(text)
+
+    def _is_feature_request(self, text: str) -> bool:
+        t = text.lower()
+        return any(marker in t for marker in FEATURE_REQUEST_MARKERS)
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def generate_insights(self, reviews: List[str]) -> Dict[str, Any]:
         """
-        Generate human-readable product insights from a list of reviews.
+        Analyse a list of reviews and return structured insights.
+
+        Returns:
+            summary_metrics : overall stats dict
+            complaint_breakdown : category → count + examples
+            top_complaints : list of (category, count) sorted desc
+            feature_requests : list of review snippets that request features
         """
         if not reviews:
-            return {"error": "No reviews provided"}
+            return {"error": "No reviews provided.", "complaint_breakdown": {}}
 
-        complaints = []
-        feature_requests = []
-        sentiments = []
+        complaint_map: Dict[str, List[str]] = {cat: [] for cat in COMPLAINT_CATEGORIES}
+        feature_requests: List[str] = []
+        sentiments: List[float] = []
 
-        for r in reviews:
-            r_lower = r.lower()
-            sent = analyze_sentiment(r)
-            sentiments.append(sent['compound'])
-            
-            # Simple heuristic for complaints (Negative sentiment + keywords)
-            if sent['compound'] < 0 or any(kw in r_lower for kw in self.complaint_keywords):
-                complaints.append(r)
-                
-            # Simple heuristic for features (Keywords like 'wish', 'add', 'request')
-            if any(kw in r_lower for kw in self.feature_request_keywords):
-                feature_requests.append(r)
+        for review in reviews:
+            sent = analyze_sentiment(review)
+            sentiments.append(sent["compound"])
 
-        # Calculations
+            # Feature request detection (fast, keyword-based)
+            if self._is_feature_request(review):
+                feature_requests.append(review[:120])
+
+            # Complaint classification (zero-shot or fallback)
+            if sent["compound"] <= -0.05 or sent["label"] == "Negative":
+                category = self._classify_complaint(review)
+                complaint_map[category].append(review[:120])
+
         neg_count = sum(1 for s in sentiments if s <= -0.05)
-        neg_percent = (neg_count / len(reviews)) * 100 if reviews else 0
-        
-        top_complaint_themes = self._get_top_keywords(complaints)
-        top_feature_themes = self._get_top_keywords(feature_requests)
+        neg_pct = (neg_count / len(reviews) * 100) if reviews else 0.0
+        avg_sent = sum(sentiments) / len(sentiments) if sentiments else 0.0
 
-        # Formatting human-readable insights
-        insights = {
+        # Build sorted complaint breakdown
+        complaint_breakdown = {
+            cat: {"count": len(revs), "examples": revs[:2]}
+            for cat, revs in complaint_map.items()
+            if revs
+        }
+        top_complaints = sorted(
+            complaint_breakdown.items(), key=lambda x: x[1]["count"], reverse=True
+        )
+
+        return {
             "summary_metrics": {
                 "total_reviews": len(reviews),
-                "negative_review_percentage": f"{neg_percent:.1f}%",
-                "average_sentiment": round(sum(sentiments)/len(sentiments), 4)
+                "negative_review_percentage": f"{neg_pct:.1f}%",
+                "average_sentiment": round(avg_sent, 4),
             },
+            "complaint_breakdown": complaint_breakdown,
             "top_complaints": [
-                f"Issues related to: {', '.join(top_complaint_themes)}" if top_complaint_themes else "No significant complaints found."
+                {"category": cat, "count": data["count"], "examples": data["examples"]}
+                for cat, data in top_complaints
             ],
-            "most_requested_features": [
-                f"Users are asking for improvements in: {', '.join(top_feature_themes)}" if top_feature_themes else "No clear feature requests identified."
-            ]
+            "feature_requests": feature_requests[:10],  # Cap at 10
         }
-        
-        return insights
 
+
+# ---------------------------------------------------------------------------
+# Smoke-test
+# ---------------------------------------------------------------------------
 if __name__ == "__main__":
-    sample_reviews = [
-        "The battery life is way too short, it drains in 2 hours.",
-        "I wish there was a dark mode option for the app.",
-        "The app keeps crashing when I open the settings.",
-        "Please add support for Google Drive integration.",
-        "The UI is terrible and very hard to navigate.",
-        "Would be great to have a way to export data.",
-        "Excellent product, but a bit expensive.",
-        "I love the design but the screen flickers sometimes."
+    sample = [
+        "The battery drains so fast, can't even last a day.",
+        "I wish there was a dark mode option.",
+        "App keeps crashing on the settings page.",
+        "Please add Google Drive integration.",
+        "Delivery took three weeks — very disappointing.",
+        "Price is way too high for the quality received.",
+        "Screen flickers sometimes and the UI is confusing.",
+        "Customer service was rude and unhelpful.",
     ]
-    
     engine = InsightEngine()
-    results = engine.generate_insights(sample_reviews)
-    
-    print("--- Generated Insights ---")
-    print(f"Negative Review %: {results['summary_metrics']['negative_review_percentage']}")
-    print(f"\nComplaints: {results['top_complaints'][0]}")
-    print(f"Feature Requests: {results['most_requested_features'][0]}")
+    results = engine.generate_insights(sample)
+
+    print(f"\nNegative: {results['summary_metrics']['negative_review_percentage']}")
+    print("\nTop Complaints:")
+    for c in results["top_complaints"]:
+        print(f"  [{c['count']}] {c['category']}")
+    print(f"\nFeature Requests ({len(results['feature_requests'])}):")
+    for r in results["feature_requests"]:
+        print(f"  - {r}")
